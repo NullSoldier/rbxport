@@ -6334,6 +6334,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trackready-rbxport-exporter"
+version = "1.10.0"
+dependencies = [
+ "rbl-export",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "transpose"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
