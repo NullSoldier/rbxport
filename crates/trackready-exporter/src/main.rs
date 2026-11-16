@@ -31,9 +31,9 @@ struct InputTrack {
 
 #[derive(Deserialize)]
 struct InputPlaylist {
-    id: u64,
+    id: String,
     name: String,
-    #[serde(default)] parent_id: u64,
+    #[serde(default)] parent_id: String,
     #[serde(default)] folder: bool,
     #[serde(default)] track_indices: Vec<usize>,
 }
@@ -47,6 +47,7 @@ struct Output {
     one_library: bool,
     warnings: Vec<rbl_export::ExportWarning>,
     track_files: Vec<OutputTrackFile>,
+    playlist_files: Vec<OutputPlaylistFile>,
 }
 
 #[derive(Serialize)]
@@ -56,6 +57,14 @@ struct OutputTrackFile {
     library_id: u64,
     device_id: u32,
     path: String,
+    preserved: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputPlaylistFile {
+    external_id: Option<String>,
+    device_id: u32,
     preserved: bool,
 }
 
@@ -94,10 +103,15 @@ fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
         file_size: track.file_size,
         ..Default::default()
     }).collect::<Vec<_>>();
+    let playlist_ids: std::collections::BTreeMap<u64, String> = input.playlists
+        .iter().map(|playlist| (internal_id(&playlist.id), playlist.id.clone())).collect();
+    if playlist_ids.len() != input.playlists.len() {
+        return Err("Two TrackReady playlist IDs map to the same device identifier".into());
+    }
     let playlists = input.playlists.into_iter().map(|playlist| SourcePlaylist {
-        id: playlist.id,
+        id: internal_id(&playlist.id),
         name: playlist.name,
-        parent_id: playlist.parent_id,
+        parent_id: if playlist.parent_id.is_empty() { 0 } else { internal_id(&playlist.parent_id) },
         folder: playlist.folder,
         track_indices: playlist.track_indices,
         ..Default::default()
@@ -118,6 +132,11 @@ fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
             device_id: track.export_id,
             path: track.audio.trim_start_matches('/').to_owned(),
             preserved: track.preserved == Some(true),
+        }).collect(),
+        playlist_files: manifest.playlists.into_iter().map(|playlist| OutputPlaylistFile {
+            external_id: playlist_ids.get(&playlist.library_id).cloned(),
+            device_id: playlist.export_id,
+            preserved: playlist.device_only,
         }).collect(),
     })
 }
@@ -153,7 +172,7 @@ mod tests {
                 sample_rate: 0, file_size: 21,
             }],
             playlists: vec![InputPlaylist {
-                id: 1, name: "Test playlist".into(), parent_id: 0, folder: false,
+                id: "1".into(), name: "Test playlist".into(), parent_id: String::new(), folder: false,
                 track_indices: vec![0],
             }],
         }).unwrap();
@@ -206,7 +225,7 @@ mod tests {
                 bpm_x100: 0, duration_sec: 0, bitrate: 0, sample_rate: 0, file_size: 16,
             }],
             playlists: vec![InputPlaylist {
-                id: 1, name: "TrackReady playlist".into(), parent_id: 0, folder: false,
+                id: "1".into(), name: "TrackReady playlist".into(), parent_id: String::new(), folder: false,
                 track_indices: vec![0],
             }],
         }).unwrap();
