@@ -12,6 +12,7 @@
 //! index and writes only under the destination directory.
 
 pub mod device_import;
+pub mod database_plan;
 pub mod device_library;
 pub mod estimate;
 pub mod ext_pdb;
@@ -107,6 +108,19 @@ pub struct SourceTrack {
     pub id: u64,
     /// Where the audio currently lives.
     pub source_path: PathBuf,
+    /// A device path whose audio will be supplied during publication. Unlike
+    /// `source_path`, this does not claim that a readable local file exists.
+    /// Used by database planning; the normal exporter leaves it unset.
+    #[serde(default)]
+    pub planned_audio_path: Option<String>,
+    /// The caller will publish Pioneer analysis companions for this planned
+    /// track. Database planning reserves their standard device location.
+    #[serde(default)]
+    pub planned_analysis: bool,
+    /// An explicitly matched row in the existing device database. Database
+    /// planning keeps its media path and analysis instead of copying audio.
+    #[serde(default)]
+    pub existing_device_id: Option<u32>,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -461,16 +475,78 @@ fn analysis_directory(audio: &str, root: &str) -> String {
     format!("/{root}/USBANLZ/P{shard:03X}/{hash:08X}")
 }
 
+/// Choose the standard Rekordbox media path from metadata alone. Callers that
+/// fetch audio later can use the same naming policy as the local exporter.
+#[must_use]
+pub fn planned_audio_path(artist: &str, album: &str, filename: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let safe_file_name = fat_file_name(filename);
+    let artist_dir = dir_name(if artist.is_empty() { "UnknownArtist" } else { artist });
+    let album_dir = dir_name(if album.is_empty() { "UnknownAlbum" } else { album });
+    format!("/Contents/{artist_dir}/{album_dir}/{safe_file_name}").nfc().collect()
+}
+
+/// Allocate a media path without reading a source file. `used` contains paths
+/// already owned by tracks on the device or earlier entries in this plan.
+/// The device's case-insensitive path rules are applied by `path_key`.
+fn reserve_audio_path(desired: &str, id: u32, used: &mut BTreeSet<String>) -> String {
+    if used.insert(path_key(desired)) { return desired.to_owned(); }
+    let original = Path::new(desired);
+    let stem = original.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = original.extension().map_or(String::new(), |s| format!(".{}", s.to_string_lossy()));
+    let parent = original.parent().unwrap_or(Path::new("/Contents"));
+    for serial in 0_u32.. {
+        let suffix = if serial == 0 { format!("-{id}") } else { format!("-{id}-{serial}") };
+        let audio = parent.join(format!("{stem}{suffix}{ext}")).to_string_lossy().into_owned();
+        if used.insert(path_key(&audio)) { return audio; }
+    }
+    unreachable!("the filename suffix space is unbounded")
+}
+
+#[cfg(test)]
+mod planned_media_tests {
+    use super::*;
+
+    #[test]
+    fn reserves_collisions_using_device_path_rules() {
+        let desired = planned_audio_path("Artist", "Album", "Track.mp3");
+        let mut used = BTreeSet::new();
+        assert_eq!(reserve_audio_path(&desired, 7, &mut used), desired);
+        assert_eq!(reserve_audio_path(&desired.to_lowercase(), 8, &mut used),
+            "/contents/artist/album/track-8.mp3");
+        assert_eq!(reserve_audio_path(&desired, 7, &mut used),
+            "/Contents/Artist/Album/Track-7.mp3");
+        assert_eq!(reserve_audio_path(&desired, 7, &mut used),
+            "/Contents/Artist/Album/Track-7-1.mp3");
+    }
+
+    #[test]
+    fn planned_paths_are_nfc_for_exfat_publication() {
+        assert_eq!(planned_audio_path("Nono\u{302}", "Album", "Nono\u{302}.mp3"),
+            "/Contents/Nonô/Album/Nonô.mp3");
+    }
+
+    #[test]
+    fn planned_layout_uses_declared_device_path_without_local_audio() {
+        let track = SourceTrack {
+            source_path: PathBuf::from("/does/not/exist.mp3"),
+            planned_audio_path: Some("/Contents/Planned/Track.mp3".into()),
+            ..Default::default()
+        };
+        let place = layout(&track, 42);
+        assert_eq!(place.audio, "/Contents/Planned/Track.mp3");
+        assert_eq!(place.file_name, "Track.mp3");
+    }
+}
+
 fn layout(track: &SourceTrack, export_id: u32) -> Layout {
-    let on_disk = track
-        .source_path
-        .file_name()
+    let on_disk = track.source_path.file_name()
         .map_or_else(|| format!("track-{export_id}.mp3"), |n| n.to_string_lossy().into_owned());
-    let file_name = fat_file_name(&on_disk);
-    let artist_dir = dir_name(if track.artist.is_empty() { "UnknownArtist" } else { &track.artist });
-    let album_dir = dir_name(if track.album.is_empty() { "UnknownAlbum" } else { &track.album });
+    let audio = track.planned_audio_path.clone().unwrap_or_else(||
+        planned_audio_path(&track.artist, &track.album, &on_disk));
+    let file_name = Path::new(&audio).file_name().unwrap_or_default().to_string_lossy().into_owned();
     Layout {
-        audio: format!("/Contents/{artist_dir}/{album_dir}/{file_name}"),
+        audio,
         // The two levels are how rekordbox spreads analysis across the tree
         // rather than putting a quarter of a million files in one directory.
         anlz_dir: format!("/PIONEER/USBANLZ/P{:03}/{export_id:08X}", export_id / 1000),
@@ -698,20 +774,8 @@ fn layouts(tracks: &[SourceTrack], ids: &[u32], root: &str, previous: Option<&Ma
                 place.file_name = Path::new(&old.audio).file_name().map_or_else(|| place.file_name.clone(), |f| f.to_string_lossy().into_owned());
             }
         }
-        if !used.insert(path_key(&place.audio)) {
-            let original = Path::new(&place.audio);
-            let stem = original.file_stem().unwrap_or_default().to_string_lossy();
-            let ext = original.extension().map_or(String::new(), |s| format!(".{}", s.to_string_lossy()));
-            let parent = original.parent().unwrap_or(Path::new("/Contents"));
-            let mut serial = 0_u32;
-            loop {
-                let suffix = if serial == 0 { format!("-{id}") } else { format!("-{id}-{serial}") };
-                let name = format!("{stem}{suffix}{ext}");
-                let audio = parent.join(&name).to_string_lossy().into_owned();
-                if used.insert(path_key(&audio)) { place.audio = audio; place.file_name = name; break; }
-                serial += 1;
-            }
-        }
+        place.audio = reserve_audio_path(&place.audio, *id, &mut used);
+        place.file_name = Path::new(&place.audio).file_name().unwrap_or_default().to_string_lossy().into_owned();
         place
     }).collect()
 }
@@ -1323,7 +1387,7 @@ fn export_cancellable_inner(
     // ones after it out from under the playlists.
     let mut export_ids: Vec<Option<u32>> = vec![None; tracks.len()];
     let mut recorded: Vec<ManifestTrack> = Vec::with_capacity(tracks.len());
-    let interns = Interns {
+    let mut interns = Interns {
         artists: &mut artists,
         albums: &mut albums,
         genres: &mut genres,
@@ -1878,77 +1942,20 @@ fn export_cancellable_inner(
         if conversion.is_some() { metadata.bit_depth = 16; }
         let library_id = track.device.as_ref().map_or(track.id, |d| d.master_content_id);
         let master_db_id = track.device.as_ref().map_or(db_id, |d| d.master_db_id);
-        one_library_tracks.push(OneLibraryTrack {
-            metadata,
-            cues: track.cues.clone(),
-            year: track.year, release_date: track.release_date.clone(),
-            bitrate: if conversion.is_some() { 0 } else { track.bitrate },
-            sample_rate: if conversion.is_some() { 44_100 } else { track.sample_rate },
-            export_id,
-            library_id,
-            master_db_id,
-            file_size: output_size,
-            title: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            genre: track.genre.clone(),
-            label: track.label.clone(),
-            key: track.key.clone(),
-            color_id: track.color_id,
-            bpm_x100: track.bpm_x100,
-            duration_sec: track.duration_sec,
-            rating: track.rating,
-            comment: track.comment.clone(),
-            date_added: track.date_added.clone(),
-            audio_path: place.audio.clone(),
-            file_name: place.file_name.clone(),
-            analysis_path: analyze_path.clone(),
-            image_id: artwork_id,
-            my_tags: track.my_tags.clone(),
-        });
-
-        track_rows.push(track_row(&TrackInput {
-            hot_cue_auto_load: track.metadata.hot_cue_auto_load,
-            id: export_id,
+        let (one, legacy) = track_database_rows(track, TrackDatabaseFields {
+            export_id, library_id, master_db_id, file_size: output_size,
+            // Rekordbox keeps the source library's recorded size unless the
+            // export converted its audio.
+            legacy_file_size: if conversion.is_some() { output_size } else if track.file_size > 0 { track.file_size } else { size },
             artwork_id,
-            artist_id: interns.artists.id(&track.artist),
-            album_id: interns.albums.id(&track.album),
-            genre_id: interns.genres.id(&track.genre),
-            label_id: interns.labels.id(&track.label),
-            key_id: interns.keys.id(&track.key),
-            color_id: track.color_id,
-            rating: track.rating,
-            tempo_x100: track.bpm_x100,
-            duration_sec: track.duration_sec,
-            year: track.year,
-            bitrate: conversion.map_or(track.bitrate, rbl_audio::compatibility::Format::bitrate),
+            one_bitrate: if conversion.is_some() { 0 } else { track.bitrate },
+            legacy_bitrate: conversion.map_or(track.bitrate, rbl_audio::compatibility::Format::bitrate),
             sample_rate: if conversion.is_some() { rbl_audio::compatibility::RATE } else { track.sample_rate },
-            // The library's figure when it has one, as rekordbox writes it,
-            // even where the file has since changed by a few bytes of tags.
-            file_size: u32::try_from(
-                (if conversion.is_some() { output_size } else if track.file_size > 0 { track.file_size } else { size }).min(u64::from(u32::MAX)),
-            )
-            .unwrap_or(0),
-            track_number: track.metadata.track_number,
-            disc_number: track.metadata.disc_number,
-            sample_depth: conversion.map_or(track.metadata.bit_depth, |_| 16),
-            // The same pair exportLibrary.db gets, as rekordbox writes both.
-            master_db_id: u32::try_from(master_db_id).unwrap_or(0),
-            master_content_id: u32::try_from(library_id).unwrap_or(0),
-            play_count: u16::try_from(track.metadata.play_count).unwrap_or(u16::MAX),
-            // The same contentLink exportLibrary.db gets (#640).
-            content_link: track.metadata.content_link,
-            isrc: track.metadata.isrc.clone(),
-            title: track.title.clone(),
-            filename: place.file_name,
-            file_path: place.audio,
-            analyze_path,
-            comment: track.comment.clone(),
-            date_added: track.date_added.clone(),
-            date_created: track.metadata.date_created.clone(),
-            release_date: track.release_date.clone(),
-            ..TrackInput::default()
-        }));
+            metadata, audio_path: place.audio, file_name: place.file_name,
+            analysis_path: analyze_path,
+        }, &mut interns);
+        one_library_tracks.push(one);
+        track_rows.push(legacy);
         if let Some(slot) = export_ids.get_mut(index) {
             *slot = Some(export_id);
         }
@@ -2489,6 +2496,63 @@ struct OneLibraryTrack {
     /// The artwork's id in the `artwork` table and the `image` table; 0 none.
     image_id: u32,
     my_tags: Vec<u64>,
+}
+
+/// Facts fixed by either the copying exporter or a database-only plan before
+/// a track is written into both device formats.
+struct TrackDatabaseFields {
+    export_id: u32,
+    library_id: u64,
+    master_db_id: u64,
+    file_size: u64,
+    legacy_file_size: u64,
+    artwork_id: u32,
+    one_bitrate: u32,
+    legacy_bitrate: u32,
+    sample_rate: u32,
+    metadata: rbl_core::ExportMetadata,
+    audio_path: String,
+    file_name: String,
+    analysis_path: String,
+}
+
+fn track_database_rows(track: &SourceTrack, fields: TrackDatabaseFields, interns: &mut Interns<'_>) -> (OneLibraryTrack, Vec<u8>) {
+    let one = OneLibraryTrack {
+        metadata: fields.metadata.clone(), cues: track.cues.clone(),
+        year: track.year, release_date: track.release_date.clone(),
+        bitrate: fields.one_bitrate, sample_rate: fields.sample_rate,
+        export_id: fields.export_id, library_id: fields.library_id,
+        master_db_id: fields.master_db_id, file_size: fields.file_size,
+        title: track.title.clone(), artist: track.artist.clone(), album: track.album.clone(),
+        genre: track.genre.clone(), label: track.label.clone(), key: track.key.clone(),
+        color_id: track.color_id, bpm_x100: track.bpm_x100, duration_sec: track.duration_sec,
+        rating: track.rating, comment: track.comment.clone(), date_added: track.date_added.clone(),
+        audio_path: fields.audio_path.clone(), file_name: fields.file_name.clone(),
+        analysis_path: fields.analysis_path.clone(), image_id: fields.artwork_id,
+        my_tags: track.my_tags.clone(),
+    };
+    let legacy = track_row(&TrackInput {
+        id: fields.export_id, artwork_id: fields.artwork_id,
+        hot_cue_auto_load: fields.metadata.hot_cue_auto_load,
+        artist_id: interns.artists.id(&track.artist), album_id: interns.albums.id(&track.album),
+        genre_id: interns.genres.id(&track.genre), label_id: interns.labels.id(&track.label),
+        key_id: interns.keys.id(&track.key), color_id: track.color_id, rating: track.rating,
+        tempo_x100: track.bpm_x100, duration_sec: track.duration_sec, year: track.year,
+        bitrate: fields.legacy_bitrate, sample_rate: fields.sample_rate,
+        file_size: u32::try_from(fields.legacy_file_size.min(u64::from(u32::MAX))).unwrap_or(0),
+        track_number: fields.metadata.track_number, disc_number: fields.metadata.disc_number,
+        sample_depth: fields.metadata.bit_depth,
+        master_db_id: u32::try_from(fields.master_db_id).unwrap_or(0),
+        master_content_id: u32::try_from(fields.library_id).unwrap_or(0),
+        play_count: u16::try_from(fields.metadata.play_count).unwrap_or(u16::MAX),
+        content_link: fields.metadata.content_link, isrc: fields.metadata.isrc.clone(),
+        title: track.title.clone(), filename: fields.file_name,
+        file_path: fields.audio_path, analyze_path: fields.analysis_path,
+        comment: track.comment.clone(), date_added: track.date_added.clone(),
+        date_created: fields.metadata.date_created.clone(), release_date: track.release_date.clone(),
+        ..TrackInput::default()
+    });
+    (one, legacy)
 }
 
 /// Where an image's files go on the stick, and what the databases name.

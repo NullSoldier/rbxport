@@ -396,7 +396,8 @@ fn identify_tracks(
                 let source_changed = previous.and_then(|m| m.generation.as_ref())
                     .and_then(|g| g.inputs.get(&track.source_path.to_string_lossy().into_owned()))
                     .is_some_and(|old| crate::incremental::revision(&track.source_path).is_ok_and(|now| now != *old));
-                let unavailable = !track.source_path.is_file() || (source_changed && std::fs::File::open(&track.source_path).is_err());
+                let unavailable = track.planned_audio_path.is_none()
+                    && (!track.source_path.is_file() || (source_changed && std::fs::File::open(&track.source_path).is_err()));
                 if unavailable && source.source_path.is_file() {
                     let master_id = track.id;
                     *track = source.clone();
@@ -897,4 +898,43 @@ pub fn all(
         })
         .collect::<Result<_>>()?;
     Ok((tracks, playlists))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod planned_media_tests {
+    use super::*;
+
+    #[test]
+    fn planned_audio_is_not_an_unavailable_local_source() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = SourceTrack {
+            id: 5,
+            source_path: root.path().join("existing.mp3"),
+            device: Some(crate::DeviceTrack { id: 7, audio: "/Contents/existing.mp3".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        std::fs::write(&existing.source_path, b"existing").unwrap();
+        let mut before = Snapshot::default();
+        before.identity.insert(7, (0, 5));
+        let mut sources = BTreeMap::new();
+        sources.insert(7, existing);
+        let planned = SourceTrack {
+            id: 5,
+            source_path: root.path().join("not-downloaded.mp3"),
+            planned_audio_path: Some("/Contents/new.mp3".into()),
+            ..Default::default()
+        };
+        let mut selected = vec![planned.clone()];
+        identify_tracks(&mut selected, &before, None, 0, &sources);
+        assert!(!selected[0].source_unavailable);
+        assert_eq!(selected[0].planned_audio_path.as_deref(), Some("/Contents/new.mp3"));
+        assert_eq!(selected[0].device.as_ref().map(|d| d.id), Some(7));
+        assert!(!selected[0].device.as_ref().unwrap().preserve);
+
+        selected = vec![SourceTrack { planned_audio_path: None, ..planned }];
+        identify_tracks(&mut selected, &before, None, 0, &sources);
+        assert!(selected[0].source_unavailable);
+        assert!(selected[0].device.as_ref().unwrap().preserve);
+    }
 }
