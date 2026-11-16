@@ -46,6 +46,16 @@ struct Output {
     playlists: usize,
     one_library: bool,
     warnings: Vec<rbl_export::ExportWarning>,
+    track_files: Vec<OutputTrackFile>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputTrackFile {
+    library_id: u64,
+    device_id: u32,
+    path: String,
+    preserved: bool,
 }
 
 fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
@@ -78,6 +88,8 @@ fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
         ..Default::default()
     }).collect::<Vec<_>>();
     let report = rbl_export::export(&destination, &tracks, &playlists)?;
+    let manifest = rbl_export::Manifest::load(&destination)
+        .ok_or("rbxport did not leave a sync manifest")?;
     Ok(Output {
         verified: report.verified,
         up_to_date: report.up_to_date,
@@ -85,6 +97,12 @@ fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
         playlists: report.playlists,
         one_library: report.one_library,
         warnings: report.warnings,
+        track_files: manifest.tracks.into_iter().map(|track| OutputTrackFile {
+            library_id: track.library_id,
+            device_id: track.export_id,
+            path: track.audio.trim_start_matches('/').to_owned(),
+            preserved: track.preserved == Some(true),
+        }).collect(),
     })
 }
 
@@ -126,6 +144,8 @@ mod tests {
         let db = root.path().join("usb/PIONEER/rekordbox");
         assert!(output.verified);
         assert!(output.one_library);
+        assert_eq!(output.track_files[0].library_id, 1);
+        assert!(output.track_files[0].path.starts_with("Contents/"));
         assert!(db.join("export.pdb").is_file());
         assert!(db.join("exportExt.pdb").is_file());
         assert!(db.join("exportLibrary.db").is_file());
@@ -176,6 +196,8 @@ mod tests {
         }).unwrap();
         assert_eq!(output.tracks, 2);
         assert!(output.one_library);
+        assert!(output.track_files.iter().any(|track| track.preserved));
+        assert!(output.track_files.iter().any(|track| track.library_id == 1 && !track.preserved));
         assert!(rbl_export::verify_databases(&usb).unwrap().is_ok());
     }
 }
