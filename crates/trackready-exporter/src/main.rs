@@ -11,7 +11,7 @@ struct Input {
 
 #[derive(Deserialize)]
 struct InputTrack {
-    id: u64,
+    id: String,
     source_path: PathBuf,
     title: String,
     #[serde(default)] artist: String,
@@ -52,16 +52,31 @@ struct Output {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OutputTrackFile {
+    external_id: Option<String>,
     library_id: u64,
     device_id: u32,
     path: String,
     preserved: bool,
 }
 
+fn internal_id(value: &str) -> u64 {
+    if let Ok(parsed) = value.parse::<u64>() { return parsed; }
+    // TrackReady uses UUIDs. This FNV-1a identifier is stable across exports
+    // and is only the numeric device-library identity; the external UUID is
+    // retained independently in the bridge output.
+    value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte|
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
 fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
     let destination = input.destination;
+    let external_ids: std::collections::BTreeMap<u64, String> = input.tracks
+        .iter().map(|track| (internal_id(&track.id), track.id.clone())).collect();
+    if external_ids.len() != input.tracks.len() {
+        return Err("Two TrackReady track IDs map to the same device identifier".into());
+    }
     let tracks = input.tracks.into_iter().map(|track| SourceTrack {
-        id: track.id,
+        id: internal_id(&track.id),
         source_path: track.source_path,
         title: track.title,
         artist: track.artist,
@@ -98,6 +113,7 @@ fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
         one_library: report.one_library,
         warnings: report.warnings,
         track_files: manifest.tracks.into_iter().map(|track| OutputTrackFile {
+            external_id: external_ids.get(&track.library_id).cloned(),
             library_id: track.library_id,
             device_id: track.export_id,
             path: track.audio.trim_start_matches('/').to_owned(),
@@ -127,7 +143,7 @@ mod tests {
         let output = export(Input {
             destination: root.path().join("usb"),
             tracks: vec![InputTrack {
-                id: 1,
+                id: "1".into(),
                 source_path: source,
                 title: "Test track".into(),
                 artist: "TrackReady".into(),
@@ -144,7 +160,7 @@ mod tests {
         let db = root.path().join("usb/PIONEER/rekordbox");
         assert!(output.verified);
         assert!(output.one_library);
-        assert_eq!(output.track_files[0].library_id, 1);
+        assert_eq!(output.track_files[0].external_id.as_deref(), Some("1"));
         assert!(output.track_files[0].path.starts_with("Contents/"));
         assert!(db.join("export.pdb").is_file());
         assert!(db.join("exportExt.pdb").is_file());
@@ -182,7 +198,7 @@ mod tests {
         let output = export(Input {
             destination: usb.clone(),
             tracks: vec![InputTrack {
-                id: 1,
+                id: "1".into(),
                 source_path: trackready_source,
                 title: "TrackReady".into(), artist: String::new(), album: String::new(),
                 genre: String::new(), label: String::new(), key: String::new(),
@@ -197,7 +213,7 @@ mod tests {
         assert_eq!(output.tracks, 2);
         assert!(output.one_library);
         assert!(output.track_files.iter().any(|track| track.preserved));
-        assert!(output.track_files.iter().any(|track| track.library_id == 1 && !track.preserved));
+        assert!(output.track_files.iter().any(|track| track.external_id.as_deref() == Some("1") && !track.preserved));
         assert!(rbl_export::verify_databases(&usb).unwrap().is_ok());
     }
 }
