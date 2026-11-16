@@ -57,6 +57,7 @@ struct OutputTrackFile {
     library_id: u64,
     device_id: u32,
     path: String,
+    analysis_dir: String,
     preserved: bool,
 }
 
@@ -131,6 +132,7 @@ fn export(input: Input) -> Result<Output, Box<dyn std::error::Error>> {
             library_id: track.library_id,
             device_id: track.export_id,
             path: track.audio.trim_start_matches('/').to_owned(),
+            analysis_dir: track.anlz_dir.trim_start_matches('/').to_owned(),
             preserved: track.preserved == Some(true),
         }).collect(),
         playlist_files: manifest.playlists.into_iter().map(|playlist| OutputPlaylistFile {
