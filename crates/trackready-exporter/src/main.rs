@@ -190,6 +190,29 @@ mod tests {
     }
 
     #[test]
+    fn keeps_uuid_identity_in_the_bridge_output() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.mp3");
+        std::fs::write(&source, b"trackready uuid test").unwrap();
+        let output = export(Input {
+            destination: root.path().join("usb"),
+            tracks: vec![InputTrack {
+                id: "7c2ca0c7-e4b9-4f80-8d6c-b51f0be8c4fa".into(), source_path: source,
+                title: "UUID track".into(), artist: String::new(), album: String::new(),
+                genre: String::new(), label: String::new(), key: String::new(),
+                comment: String::new(), date_added: String::new(), release_date: String::new(),
+                bpm_x100: 0, duration_sec: 0, bitrate: 0, sample_rate: 0, file_size: 21,
+            }],
+            playlists: vec![InputPlaylist {
+                id: "178951c7-e4b9-4f80-8d6c-b51f0be8c4fa".into(), name: "UUID playlist".into(),
+                parent_id: String::new(), folder: false, track_indices: vec![0],
+            }],
+        }).unwrap();
+        assert_eq!(output.track_files[0].external_id.as_deref(), Some("7c2ca0c7-e4b9-4f80-8d6c-b51f0be8c4fa"));
+        assert_eq!(output.playlist_files[0].external_id.as_deref(), Some("178951c7-e4b9-4f80-8d6c-b51f0be8c4fa"));
+    }
+
+    #[test]
     fn retains_an_unknown_device_track_when_adding_a_trackready_track() {
         let root = tempfile::tempdir().unwrap();
         let usb = root.path().join("usb");
